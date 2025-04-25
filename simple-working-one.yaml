@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k8s-job-cleanup
+  namespace: test-namespace
+spec:
+  schedule: "*/5 * * * *"  # Run every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: bitnami/kubectl:latest
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              #!/bin/sh
+              while true; do
+                echo "Starting cleanup iteration..."
+                
+                # Delete completed jobs
+                echo "Deleting completed jobs..."
+                kubectl delete jobs -n test-namespace --field-selector status.successful=1
+                
+                # List remaining jobs
+                echo "Current jobs in namespace:"
+                kubectl get jobs -n test-namespace
+                
+                # Sleep for a bit
+                sleep 30
+              done
+          restartPolicy: OnFailure
