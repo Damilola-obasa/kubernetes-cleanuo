@@ -1,0 +1,78 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k8s-job-cleanup
+spec:
+  schedule: "*/5 * * * *"  # Run every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: bitnami/kubectl:latest
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: BUILDKITE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: my-buildkite-agent-stack-k8s-secret
+                  key: BUILDKITE_TOKEN
+            - name: CLEANUP_K8S_NAMESPACE
+              value: "mynamespace"
+            - name: CLEANUP_ITERATION_SLEEP_SECONDS
+              value: "30"
+            - name: BUILDKITE_ORG
+              value: "your-org"  # Replace with your Buildkite organization
+            - name: BUILDKITE_PIPELINE
+              value: "your-pipeline"  # Replace with your pipeline name
+            command:
+            - /bin/sh
+            - -c
+            - |
+              #!/bin/sh
+              while true; do
+                iteration_start_seconds=$SECONDS
+                
+                # Get all jobs in the namespace
+                k8s_jobs_json=$(kubectl get jobs -n "$CLEANUP_K8S_NAMESPACE" -o json)
+                total_k8s_jobs=$(echo "$k8s_jobs_json" | jq '.items | length')
+                echo "Found $total_k8s_jobs K8S jobs"
+                
+                # Process each job
+                echo "$k8s_jobs_json" | jq -r '.items[] | select(.metadata.annotations["buildkite.com/job-url"]) | "\(.metadata.name) \(.metadata.annotations["buildkite.com/job-url"])"' | while read k8s_job_name buildkite_url; do
+                  # Extract build ID and job ID from Buildkite URL
+                  # URL format: https://buildkite.com/org/pipeline/builds/build-id#job-id
+                  build_id=$(echo "$buildkite_url" | grep -o 'builds/[^#]*' | cut -d'/' -f2)
+                  job_id=$(echo "$buildkite_url" | grep -o '#[^#]*$' | cut -d'#' -f2)
+                  
+                  if [ -z "$build_id" ] || [ -z "$job_id" ]; then
+                    echo "Warning: Could not extract build_id or job_id from URL: $buildkite_url"
+                    continue
+                  fi
+                  
+                  # Get job state from Buildkite API
+                  buildkite_job_state=$(curl -s -H "Authorization: Bearer $BUILDKITE_TOKEN" \
+                    "https://api.buildkite.com/v2/organizations/$BUILDKITE_ORG/pipelines/$BUILDKITE_PIPELINE/builds/$build_id/jobs/$job_id" | \
+                    jq -r '.state')
+                  
+                  if [ -z "$buildkite_job_state" ]; then
+                    echo "Warning: Could not get job state for $buildkite_url"
+                    continue
+                  fi
+                  
+                  overall_job_description="K8S job $k8s_job_name (Buildkite: $buildkite_url)"
+                  
+                  if [[ "$buildkite_job_state" == "canceled" ]]; then
+                    echo "$overall_job_description is CANCELLED. Deleting associated K8S job!"
+                    kubectl delete job -n "$CLEANUP_K8S_NAMESPACE" "$k8s_job_name"
+                  else
+                    echo "$overall_job_description is in NON-CLEANABLE state = $buildkite_job_state. Skipping K8S job deletion."
+                  fi
+                done
+                
+                iteration_duration_seconds=$((SECONDS - iteration_start_seconds))
+                echo "Cleanup loop iteration ended, took ${iteration_duration_seconds}s, sleeping ${CLEANUP_ITERATION_SLEEP_SECONDS}s before next iteration..."
+                sleep "$CLEANUP_ITERATION_SLEEP_SECONDS"
+              done
+          restartPolicy: OnFailure
