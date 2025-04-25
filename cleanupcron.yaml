@@ -2,8 +2,9 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: k8s-job-cleanup
+  namespace: test-namespace
 spec:
-  schedule: "*/5 * * * *"  # Run every 5 minutes
+  schedule: "*/2 * * * *"  # Run every 2 minutes
   jobTemplate:
     spec:
       template:
@@ -12,6 +13,7 @@ spec:
           - name: cleanup
             image: bitnami/kubectl:latest
             imagePullPolicy: IfNotPresent
+            # Environment variables for configuration
             env:
             - name: BUILDKITE_TOKEN
               valueFrom:
@@ -19,60 +21,103 @@ spec:
                   name: my-buildkite-agent-stack-k8s-secret
                   key: BUILDKITE_TOKEN
             - name: CLEANUP_K8S_NAMESPACE
-              value: "mynamespace"
-            - name: CLEANUP_ITERATION_SLEEP_SECONDS
-              value: "30"
+              value: "test-namespace"  # Namespace where jobs will be cleaned up
             - name: BUILDKITE_ORG
-              value: "your-org"  # Replace with your Buildkite organization
+              value: "test-org"  # Buildkite organization name
             - name: BUILDKITE_PIPELINE
-              value: "your-pipeline"  # Replace with your pipeline name
+              value: "test-pipeline"  # Buildkite pipeline name
+            - name: JOB_AGE_MINUTES
+              value: "10"  # Clean up jobs older than 10 minutes
             command:
-            - /bin/sh
+            - /bin/bash
             - -c
             - |
-              #!/bin/sh
-              while true; do
-                iteration_start_seconds=$SECONDS
-                
-                # Get all jobs in the namespace
-                k8s_jobs_json=$(kubectl get jobs -n "$CLEANUP_K8S_NAMESPACE" -o json)
-                total_k8s_jobs=$(echo "$k8s_jobs_json" | jq '.items | length')
-                echo "Found $total_k8s_jobs K8S jobs"
-                
-                # Process each job
-                echo "$k8s_jobs_json" | jq -r '.items[] | select(.metadata.annotations["buildkite.com/job-url"]) | "\(.metadata.name) \(.metadata.annotations["buildkite.com/job-url"])"' | while read k8s_job_name buildkite_url; do
-                  # Extract build ID and job ID from Buildkite URL
-                  # URL format: https://buildkite.com/org/pipeline/builds/build-id#job-id
-                  build_id=$(echo "$buildkite_url" | grep -o 'builds/[^#]*' | cut -d'/' -f2)
-                  job_id=$(echo "$buildkite_url" | grep -o '#[^#]*$' | cut -d'#' -f2)
-                  
-                  if [ -z "$build_id" ] || [ -z "$job_id" ]; then
-                    echo "Warning: Could not extract build_id or job_id from URL: $buildkite_url"
+              #!/bin/bash
+              # Enable strict error handling
+              set -euo pipefail
+              
+              # Install required tools for the script
+              echo "Installing required tools..."
+              apt-get update && apt-get install -y curl jq
+              
+              # Validate all required environment variables are set
+              echo "Validating environment variables..."
+              required_vars=("BUILDKITE_TOKEN" "CLEANUP_K8S_NAMESPACE" "BUILDKITE_ORG" "BUILDKITE_PIPELINE" "JOB_AGE_MINUTES")
+              for var in "${required_vars[@]}"; do
+                if [[ -z "${!var}" ]]; then
+                  echo "Error: $var environment variable is not set."
+                  exit 1
+                fi
+              done
+              
+              # Log the start of cleanup iteration with timestamp
+              echo "Starting cleanup iteration at $(date '+%F %H:%M:%S %Z')"
+              
+              # Get current timestamp for age calculations
+              current_time=$(date +%s)
+              
+              # Step 1: Clean up completed non-Buildkite jobs
+              # These are jobs without Buildkite annotations that have completed successfully
+              echo "Cleaning up completed non-Buildkite jobs..."
+              kubectl delete jobs -n "$CLEANUP_K8S_NAMESPACE" --field-selector status.successful=1
+              
+              # Step 2: Process Buildkite jobs
+              # Get all jobs with Buildkite URL annotation and their creation times
+              echo "Checking Buildkite jobs..."
+              jobs=$(kubectl get jobs -n "$CLEANUP_K8S_NAMESPACE" -o json | jq -r '.items[] | select(.metadata.annotations["buildkite.com/job-url"]) | "\(.metadata.name) \(.metadata.annotations["buildkite.com/job-url"]) \(.metadata.creationTimestamp)"')
+              
+              if [ -z "$jobs" ]; then
+                echo "No Buildkite jobs found"
+              else
+                # Process each Buildkite job
+                echo "$jobs" | while read -r job_name buildkite_url creation_time; do
+                  if [ -z "$job_name" ]; then
                     continue
                   fi
                   
-                  # Get job state from Buildkite API
-                  buildkite_job_state=$(curl -s -H "Authorization: Bearer $BUILDKITE_TOKEN" \
-                    "https://api.buildkite.com/v2/organizations/$BUILDKITE_ORG/pipelines/$BUILDKITE_PIPELINE/builds/$build_id/jobs/$job_id" | \
-                    jq -r '.state')
+                  echo "Processing job: $job_name"
                   
-                  if [ -z "$buildkite_job_state" ]; then
-                    echo "Warning: Could not get job state for $buildkite_url"
-                    continue
-                  fi
+                  # Convert job creation time to timestamp for age calculation
+                  job_timestamp=$(date -d "$creation_time" +%s)
                   
-                  overall_job_description="K8S job $k8s_job_name (Buildkite: $buildkite_url)"
+                  # Calculate job age in minutes
+                  age_minutes=$(( (current_time - job_timestamp) / 60 ))
                   
-                  if [[ "$buildkite_job_state" == "canceled" ]]; then
-                    echo "$overall_job_description is CANCELLED. Deleting associated K8S job!"
-                    kubectl delete job -n "$CLEANUP_K8S_NAMESPACE" "$k8s_job_name"
+                  # Only process jobs older than JOB_AGE_MINUTES
+                  if [ "$age_minutes" -ge "$JOB_AGE_MINUTES" ]; then
+                    echo "Job $job_name is $age_minutes minutes old. Checking Buildkite status..."
+                    
+                    # Extract Buildkite build and job IDs from the URL
+                    # URL format: https://buildkite.com/org/pipeline/builds/build-id#job-id
+                    build_id=$(echo "$buildkite_url" | grep -o 'builds/[^#]*' | cut -d'/' -f2)
+                    job_id=$(echo "$buildkite_url" | grep -o '#[^#]*$' | cut -d'#' -f2)
+                    
+                    if [ -n "$build_id" ] && [ -n "$job_id" ]; then
+                      # Query Buildkite API to get job state
+                      buildkite_job_state=$(curl -s -H "Authorization: Bearer $BUILDKITE_TOKEN" \
+                        "https://api.buildkite.com/v2/organizations/$BUILDKITE_ORG/pipelines/$BUILDKITE_PIPELINE/builds/$build_id/jobs/$job_id" | \
+                        jq -r '.state')
+                      
+                      # Delete job if it's finished or canceled in Buildkite
+                      if [ "$buildkite_job_state" = "finished" ] || [ "$buildkite_job_state" = "canceled" ]; then
+                        echo "Job $job_name is in state $buildkite_job_state and is $age_minutes minutes old. Deleting..."
+                        kubectl delete job "$job_name" -n "$CLEANUP_K8S_NAMESPACE"
+                      else
+                        echo "Job $job_name is in state $buildkite_job_state. Skipping deletion."
+                      fi
+                    else
+                      # If we can't verify the Buildkite status, delete old jobs anyway
+                      echo "Could not extract build_id or job_id from URL: $buildkite_url"
+                      echo "Deleting job $job_name as it's $age_minutes minutes old and Buildkite status cannot be verified"
+                      kubectl delete job "$job_name" -n "$CLEANUP_K8S_NAMESPACE"
+                    fi
                   else
-                    echo "$overall_job_description is in NON-CLEANABLE state = $buildkite_job_state. Skipping K8S job deletion."
+                    echo "Job $job_name is only $age_minutes minutes old. Skipping..."
                   fi
                 done
-                
-                iteration_duration_seconds=$((SECONDS - iteration_start_seconds))
-                echo "Cleanup loop iteration ended, took ${iteration_duration_seconds}s, sleeping ${CLEANUP_ITERATION_SLEEP_SECONDS}s before next iteration..."
-                sleep "$CLEANUP_ITERATION_SLEEP_SECONDS"
-              done
+              fi
+              
+              # Final step: Show remaining jobs in the namespace
+              echo "Current jobs in namespace:"
+              kubectl get jobs -n "$CLEANUP_K8S_NAMESPACE" --sort-by=.metadata.creationTimestamp
           restartPolicy: OnFailure
